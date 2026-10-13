@@ -1,0 +1,17 @@
+{
+  "name": "phantom-nulldash-client",
+  "version": "1.7.0",
+  "description": "PHANTOM BY NULLDASH — key login, tunnel status, live match features replica",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "phantom",
+    "nulldash",
+    "client"
+  ],
+  "author": "NullDash",
+  "license": "ISC"
+}

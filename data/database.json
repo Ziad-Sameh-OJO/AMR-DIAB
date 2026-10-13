@@ -1,0 +1,143 @@
+{
+  "maintenance": {
+    "enabled": false,
+    "allowed_logins": [
+      "owner",
+      "admin",
+      "test",
+      "PHTM-TEST-1234-5678"
+    ],
+    "blocked": false,
+    "title": "maintenance",
+    "message": "we're doing maintenance. everything is paused until we're back."
+  },
+  "global_features": {
+    "marker": {
+      "enabled": true,
+      "type": "Phantom"
+    },
+    "aimLag": {
+      "enabled": false,
+      "onFire": false,
+      "onScope": false
+    },
+    "fastLanding": {
+      "enabled": false,
+      "spot": "Peak"
+    },
+    "fastRevive": {
+      "enabled": false
+    },
+    "gloo": {
+      "enabled": false,
+      "yawDeg": 180
+    },
+    "aimpoint": {
+      "enabled": false
+    }
+  },
+  "nodes": [
+    {
+      "id": "sg1",
+      "name": "Singapore Node 01",
+      "flag": "🇸🇬",
+      "host": "sg1.nulldash.store",
+      "port": 443,
+      "ping": 24,
+      "status": "online",
+      "users": 48
+    },
+    {
+      "id": "del1",
+      "name": "Delhi Node 02",
+      "flag": "🇮🇳",
+      "host": "del1.nulldash.store",
+      "port": 443,
+      "ping": 38,
+      "status": "online",
+      "users": 29
+    },
+    {
+      "id": "fr1",
+      "name": "France Node 03",
+      "flag": "🇫🇷",
+      "host": "fr1.nulldash.store",
+      "port": 443,
+      "ping": 110,
+      "status": "online",
+      "users": 12
+    }
+  ],
+  "keys": [
+    {
+      "key": "PHTM-F37D-9WHW-YB9G",
+      "status": "active",
+      "bound_hwid": "PHTM-0305-595F-595F",
+      "device_model": "Mac (Apple GPU)",
+      "created_at": "2026-10-13T14:45:03.742Z",
+      "expires_at": "2026-11-12T14:45:03.745Z",
+      "note": "Generated from Admin Panel",
+      "features": {
+        "marker": {
+          "enabled": true,
+          "type": "Phantom"
+        },
+        "aimLag": {
+          "enabled": false,
+          "onFire": false,
+          "onScope": false
+        },
+        "fastLanding": {
+          "enabled": false,
+          "spot": "Peak"
+        },
+        "fastRevive": {
+          "enabled": false
+        },
+        "gloo": {
+          "enabled": false,
+          "yawDeg": 180
+        },
+        "aimpoint": {
+          "enabled": false
+        }
+      },
+      "device_os": "macOS 10.15"
+    },
+    {
+      "key": "PHTM-LLQ5-ZGCQ-6XTJ",
+      "status": "active",
+      "bound_hwid": "PHTM-4A79-1023-1023",
+      "device_model": "Windows PC (NVIDIA GeForce RTX 4060 (0x00002808)",
+      "created_at": "2026-10-01T13:09:10.010Z",
+      "expires_at": "2026-10-31T13:09:10.010Z",
+      "note": "Generated from Admin Panel",
+      "features": {
+        "marker": {
+          "enabled": true,
+          "type": "Phantom"
+        },
+        "aimLag": {
+          "enabled": false,
+          "onFire": false,
+          "onScope": false
+        },
+        "fastLanding": {
+          "enabled": false,
+          "spot": "Peak"
+        },
+        "fastRevive": {
+          "enabled": false
+        },
+        "gloo": {
+          "enabled": false,
+          "yawDeg": 180
+        },
+        "aimpoint": {
+          "enabled": false
+        }
+      },
+      "device_os": "Windows 10/11"
+    }
+  ]
+}
