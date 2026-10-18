@@ -1,0 +1,1 @@
+Legacy simulation only. These files are retained for comparison with the original repository. The portal does not import, execute, or publicly serve them. Their packet counters and simulated pawns do not implement a VPN or Free Fire game modification.

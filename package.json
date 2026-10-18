@@ -1,17 +1,10 @@
 {
-  "name": "phantom-nulldash-client",
-  "version": "1.7.0",
-  "description": "PHANTOM BY NULLDASH — key login, tunnel status, live match features replica",
+  "name": "phantom-happ-portal",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Independent subscription portal for Happ and Hysteria2",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
-  },
-  "keywords": [
-    "phantom",
-    "nulldash",
-    "client"
-  ],
-  "author": "NullDash",
+  "engines": { "node": ">=22.16" },
+  "scripts": { "start": "node server.js", "dev": "node server.js", "setup": "node scripts/setup.cjs", "test": "node --test test/*.test.cjs", "deploy:config": "node scripts/deploy-config.cjs" },
   "license": "ISC"
 }

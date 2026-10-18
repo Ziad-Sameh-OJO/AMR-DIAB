@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+data/runtime/
+node_modules/
+*.log
+deploy/generated/

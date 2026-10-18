@@ -1,556 +1,226 @@
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const db = require('./data/db');
-const interceptor = require('./src/engine/packet_interceptor');
-const gameTunnel = require('./src/engine/game_tunnel');
-
-// Start active UDP game tunnel
-gameTunnel.start();
-
-// Initialize interceptor with saved features
-interceptor.setFeatures(db.get().global_features);
-
-const PORT = process.env.PORT || 3000;
-const ROOT_DIR = __dirname;
-
-const MIME_TYPES = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2',
-  '.woff': 'font/woff',
-  '.ttf': 'font/ttf'
-};
-
-// SSE Clients set
-const sseClients = new Set();
-
-function broadcastEvent(eventName, data) {
-  for (const client of sseClients) {
-    try {
-      client.write(`event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`);
-    } catch (e) {
-      sseClients.delete(client);
-    }
-  }
+'use strict';
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { Store } = require('./lib/store');
+const { configFromEnv } = require('./lib/config');
+const { hash, equal, active, token, resolveToken, uri, connectionId, Monitor } = require('./lib/vpn');
+const ROOT = __dirname;
+const FEATURES = [
+  { id: 'marker', name: 'Marker' }, { id: 'aimpoint', name: 'Aimpoint' },
+  { id: 'aimLag', name: 'Aim Lag' }, { id: 'gloo', name: 'Gloo Wall Rotation' },
+  { id: 'fastRevive', name: 'Fast Revive' },
+].map(f => ({ ...f, available: false, enabled: false, reason: 'No verified game integration is installed.' }));
+const ASSETS = new Map([
+  ['/', ['index.html','text/html']], ['/admin', ['public/admin.html','text/html']],
+  ['/admin/', ['public/admin.html','text/html']], ['/admin.js', ['public/admin.js','text/javascript']],
+  ['/src/app.js', ['src/app.js','text/javascript']], ['/src/ui.js', ['src/ui.js','text/javascript']],
+  ['/src/styles.css', ['src/styles.css','text/css']], ['/icon.png', ['public/icon.png','image/png']],
+]);
+for (const name of fs.readdirSync(path.join(ROOT, 'public/media'))) if (/^[\w.-]+\.woff2$/.test(name)) ASSETS.set('/media/'+name, ['public/media/'+name,'font/woff2']);
+function error(status, message) { return Object.assign(new Error(message), { status }); }
+function text(body, key, max = 100, required = true) {
+  const v = body[key];
+  if (v === undefined && !required) return '';
+  if (typeof v !== 'string' || v.trim().length > max || (required && !v.trim())) throw error(400, `Invalid ${key}`);
+  return v.trim();
 }
-
-function sendJson(res, statusCode, data) {
-  res.writeHead(statusCode, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*'
-  });
+function integer(body, key, min, max, fallback) {
+  const n = body[key] === undefined ? fallback : body[key];
+  if (!Number.isInteger(n) || n < min || n > max) throw error(400, `Invalid ${key}`);
+  return n;
+}
+async function jsonBody(req) {
+  if (!(req.headers['content-type'] || '').startsWith('application/json')) throw error(415, 'JSON required');
+  let size = 0; const chunks = [];
+  for await (const chunk of req) { size += chunk.length; if (size > 16384) throw error(413, 'Request too large'); chunks.push(chunk); }
+  try { const value = JSON.parse(Buffer.concat(chunks).toString()); if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(); return value; }
+  catch { throw error(400, 'Invalid JSON'); }
+}
+function send(res, status, data, extra = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...extra });
   res.end(JSON.stringify(data));
 }
-
-function parseJsonBody(req) {
-  return new Promise((resolve) => {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(body || '{}'));
-      } catch (e) {
-        resolve({});
-      }
+function createApplication(config) {
+  const store = new Store(config.file);
+  const monitor = new Monitor(config, store);
+  const limits = new Map();
+  function limit(req, category, max) {
+    // Never trust a caller-supplied forwarded address.
+    const id = `${req.socket.remoteAddress}:${category}`, now = Date.now();
+    if (limits.size > 10000) for (const [k,v] of limits) if (v.until < now) limits.delete(k);
+    const entry = limits.get(id);
+    const next = !entry || entry.until < now ? { count: 1, until: now + 60000 } : { ...entry, count: entry.count + 1 };
+    limits.set(id, next);
+    if (next.count > max) throw error(429, 'Too many requests. Try again in a minute.');
+  }
+  function audit(d, action, keyId = null) { d.audit.push({ at: new Date().toISOString(), action, keyId }); }
+  function cookie(res, role, value, age) {
+    res.setHeader('Set-Cookie', `${role === 'admin' ? 'phantom_admin' : 'phantom_session'}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}${config.secure ? '; Secure' : ''}`);
+  }
+  function session(req, role) {
+    const name = role === 'admin' ? 'phantom_admin' : 'phantom_session';
+    const value = (req.headers.cookie || '').split(';').map(v=>v.trim()).find(v=>v.startsWith(name+'='))?.slice(name.length+1);
+    if (!value) throw error(401, 'Sign in to continue');
+    const s = store.data.sessions.find(s=>s.hash === hash(value) && s.role === role && s.expires > Date.now());
+    if (!s) throw error(401, 'Session expired. Sign in again.');
+    if (role === 'user') {
+      const k = store.data.keys.find(k=>k.id === s.keyId);
+      if (!active(k)) throw error(401, 'Subscription expired or revoked');
+      return { session: s, key: k };
+    }
+    return { session: s };
+  }
+  function makeSession(res, role, keyId) {
+    const value = crypto.randomBytes(32).toString('base64url');
+    store.update(d=>{
+      d.sessions = d.sessions.filter(s => !(s.role === role && s.keyId === keyId));
+      d.sessions.push({ hash: hash(value), role, keyId, expires: Date.now()+12*3600000 });
+      audit(d, `${role}.login`, keyId);
     });
-  });
-}
-
-function generateRandomKey(prefix = 'PHTM') {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const chunk = () => Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-  return `${prefix}-${chunk()}-${chunk()}-${chunk()}`;
-}
-
-function detectServerDevice(ua = '') {
-  let os = 'Unknown OS';
-  let model = 'Unknown Device';
-
-  if (/Windows NT 10.0/i.test(ua)) {
-    os = 'Windows 10/11 64-bit';
-    model = 'Windows PC';
-  } else if (/Windows NT 6.3/i.test(ua)) {
-    os = 'Windows 8.1';
-    model = 'Windows PC';
-  } else if (/Windows NT 6.1/i.test(ua)) {
-    os = 'Windows 7';
-    model = 'Windows PC';
-  } else if (/iPhone/i.test(ua)) {
-    const v = ua.match(/OS (\d+[_\.]\d+)/);
-    os = v ? `iOS ${v[1].replace('_', '.')}` : 'iOS';
-    model = `iPhone (${os})`;
-  } else if (/iPad/i.test(ua)) {
-    const v = ua.match(/OS (\d+[_\.]\d+)/);
-    os = v ? `iPadOS ${v[1].replace('_', '.')}` : 'iPadOS';
-    model = `iPad (${os})`;
-  } else if (/Macintosh|Mac OS X/i.test(ua)) {
-    const v = ua.match(/Mac OS X (\d+[_\.]\d+)/);
-    os = v ? `macOS ${v[1].replace('_', '.')}` : 'macOS';
-    model = `Mac (${os})`;
-  } else if (/Android/i.test(ua)) {
-    const v = ua.match(/Android (\d+(\.\d+)?)/);
-    os = v ? `Android ${v[1]}` : 'Android';
-    const m = ua.match(/;\s*([A-Za-z0-9\-\s\_]+)\s+Build\//);
-    model = m ? `${m[1].trim()} (${os})` : `Android Device (${os})`;
-  } else if (/Linux/i.test(ua)) {
-    os = 'Linux';
-    model = 'Linux Desktop';
+    cookie(res, role, value, 12*3600);
   }
-
-  let browser = 'Browser';
-  if (/Edg\//i.test(ua)) browser = 'Edge';
-  else if (/Chrome\//i.test(ua)) browser = 'Chrome';
-  else if (/Safari\//i.test(ua) && !/Chrome/i.test(ua)) browser = 'Safari';
-  else if (/Firefox\//i.test(ua)) browser = 'Firefox';
-
-  if (model === 'Windows PC' || model === 'Linux Desktop') {
-    model = `${model} (${browser})`;
+  function view(k) {
+    return { id: k.id, label: k.label, status: k.status === 'revoked' ? 'revoked' : !active(k) ? 'expired' : k.activatedAt ? 'active' : 'pending', days: k.days,
+      activatedAt: k.activatedAt, expiresAt: k.expiresAt, deviceLabel: k.deviceLabel, bound: !!k.deviceHash,
+      note: k.note, vpn: monitor.status(k) };
   }
-
-  return { os, model };
-}
-
-const server = http.createServer(async (req, res) => {
-  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const pathname = parsedUrl.pathname;
-
-  // CORS headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  // ==========================================
-  // CLIENT API ENDPOINTS
-  // ==========================================
-
-  // Check Maintenance Status
-  if (pathname === '/api/maintenance' && req.method === 'GET') {
-    return sendJson(res, 200, db.getMaintenance());
-  }
-
-  // Client Key Authentication / Redeem
-  if (pathname === '/api/redeem' && req.method === 'POST') {
-    const body = await parseJsonBody(req);
-    const rawKey = (body.key || '').trim();
-    const key = rawKey.toUpperCase();
-
-    if (!rawKey) {
-      return sendJson(res, 400, { error: 'enter your full key' });
-    }
-
-    const ua = req.headers['user-agent'] || '';
-    const serverDev = detectServerDevice(ua);
-    const clientHwid = (body.hwid || '').trim() || `PHTM-${crypto.createHash('md5').update(ua + (req.socket.remoteAddress || '')).digest('hex').slice(0, 8).toUpperCase()}`;
-    const clientDeviceModel = (body.device_model || '').trim() || serverDev.model;
-    const clientDeviceOs = (body.device_os || '').trim() || serverDev.os;
-
-    const maintenance = db.getMaintenance();
-    const isSpecialLogin = ['OWNER', 'ADMIN', 'TEST'].includes(key);
-
-    // Maintenance check
-    if (maintenance.enabled) {
-      const isAllowed = maintenance.allowed_logins.some(
-        item => item.toUpperCase() === key || (isSpecialLogin && item.toUpperCase() === key)
-      );
-      if (!isAllowed) {
-        return sendJson(res, 403, { 
-          error: maintenance.blocked 
-            ? 'your account is paused during maintenance. back soon.' 
-            : 'maintenance in progress. only allowed test logins are currently permitted.' 
-        });
+  async function handler(req, res) {
+    res.setHeader('Cache-Control','no-store'); res.setHeader('Referrer-Policy','no-referrer');
+    res.setHeader('X-Content-Type-Options','nosniff'); res.setHeader('X-Frame-Options','DENY');
+    res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+    if (config.secure) res.setHeader('Strict-Transport-Security','max-age=31536000');
+    try {
+      const url = new URL(req.url, config.publicURL), p = url.pathname;
+      if (!['GET','POST','PATCH'].includes(req.method)) throw error(405,'Method not allowed');
+      if (req.method !== 'GET') {
+        if (req.headers['x-phantom-request'] !== '1' || (req.headers.origin && req.headers.origin !== config.publicURL) || req.headers['sec-fetch-site'] === 'cross-site') throw error(403,'Request origin rejected');
       }
-    }
-
-    // Special Owner / Test Access
-    if (isSpecialLogin) {
-      return sendJson(res, 200, {
-        ok: true,
-        me: {
-          status: 'active',
-          bound_hwid: clientHwid,
-          device_model: clientDeviceModel,
-          device_os: clientDeviceOs,
-          expires_at: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
-          features: db.get().global_features
+      if (p === '/api/health' && req.method === 'GET') return send(res,200,{ok:true});
+      if (p === '/api/redeem' && req.method === 'POST') {
+        limit(req,'login',10);
+        const body = await jsonBody(req);
+        const raw = text(body,'key',100).toUpperCase(), device = text(body,'deviceId',100);
+        const deviceLabel = text(body,'deviceLabel',80,false) || 'Browser';
+        const k = store.data.keys.find(k=>k.keyHash === hash(raw));
+        if (!active(k)) throw error(401,'Invalid, expired or revoked key');
+        if (store.data.maintenance) throw error(503,'Service is under maintenance');
+        if (k.deviceHash && k.deviceHash !== hash(device)) throw error(403,'This key is linked to another browser. Ask the administrator to reset it.');
+        store.update(d=>{ const record=d.keys.find(x=>x.id===k.id); record.deviceHash=hash(device); record.deviceLabel=deviceLabel; });
+        makeSession(res,'user',k.id);
+        return send(res,200,{me:view(store.data.keys.find(x=>x.id===k.id))});
+      }
+      if (p === '/api/admin/login' && req.method === 'POST') {
+        limit(req,'admin-login',5);
+        const body = await jsonBody(req);
+        if (!equal(text(body,'password',256),config.adminToken)) throw error(401,'Invalid administrator password');
+        makeSession(res,'admin',null); return send(res,200,{ok:true});
+      }
+      if (p.startsWith('/sub/') && req.method === 'GET') {
+        limit(req,'subscription',60);
+        if (!config.vpn.configured) throw error(503,'VPN server is not configured');
+        if (store.data.maintenance) throw error(503,'Service is under maintenance');
+        const k = resolveToken(config,store,'subscription',p.slice(5));
+        if (!k) throw error(401,'Invalid or expired subscription');
+        const info = k.expiresAt ? { 'subscription-userinfo': `expire=${Math.floor(Date.parse(k.expiresAt)/1000)}` } : {};
+        res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8','profile-update-interval':'1',...info});
+        return res.end(uri(config,k)+'\n');
+      }
+      if (p.startsWith('/api/admin/')) {
+        session(req,'admin'); limit(req,'admin',120);
+        if (p === '/api/admin/logout' && req.method === 'POST') {
+          const {session:s}=session(req,'admin');store.update(d=>{d.sessions=d.sessions.filter(x=>x.hash!==s.hash);});cookie(res,'admin','',0);return send(res,200,{ok:true});
         }
-      });
-    }
-
-    // Check Key in Database
-    let keyRecord = db.findKey(key);
-
-    if (!keyRecord) {
-      // Crack / Bypass Mode: Auto-generate and activate lifetime VIP license for any custom key entered!
-      keyRecord = {
-        key: key.startsWith('PHTM') ? key : `PHTM-${key.padEnd(4, 'X').slice(0, 4)}-CRACKED-KEY`,
-        status: 'active',
-        bound_hwid: clientHwid,
-        device_model: clientDeviceModel,
-        device_os: clientDeviceOs,
-        created_at: new Date().toISOString(),
-        expires_at: new Date(Date.now() + 3650 * 24 * 3600 * 1000).toISOString(),
-        note: 'Auto-Enrolled License',
-        features: db.get().global_features
-      };
-      db.addKey(keyRecord);
-    }
-
-    if (keyRecord.status === 'revoked') {
-      return sendJson(res, 400, { error: 'this license key has been revoked' });
-    }
-
-    if (new Date(keyRecord.expires_at).getTime() < Date.now()) {
-      return sendJson(res, 400, { error: 'this license key has expired' });
-    }
-
-    // Device lock check & binding
-    if (!keyRecord.bound_hwid) {
-      // Key was unbound: lock to current real client device
-      keyRecord.bound_hwid = clientHwid;
-      keyRecord.device_model = clientDeviceModel;
-      keyRecord.device_os = clientDeviceOs;
-      db.updateKey(key, {
-        bound_hwid: clientHwid,
-        device_model: clientDeviceModel,
-        device_os: clientDeviceOs
-      });
-    } else {
-      // Key is bound to a device: verify HWID match
-      if (keyRecord.bound_hwid !== clientHwid) {
-        return sendJson(res, 403, { 
-          error: `key is locked to another device (${keyRecord.device_model || 'other device'}). reset device lock from the site first.` 
+        if (p === '/api/admin/overview' && req.method === 'GET') return send(res,200,{
+          keys:store.data.keys.map(view),maintenance:store.data.maintenance,
+          vpn:{configured:config.vpn.configured,host:config.vpn.host||null,telemetry:monitor.error ? 'unavailable' : monitor.snapshot ? 'available' : 'unknown',checkedAt:monitor.snapshot?.at||null},
+          audit:store.data.audit.slice(-30).reverse(),
         });
-      }
-      // Update device_model if client provided enriched details (e.g. GPU)
-      if (clientDeviceModel && clientDeviceModel !== 'Unknown Device' && clientDeviceModel !== keyRecord.device_model) {
-        keyRecord.device_model = clientDeviceModel;
-        keyRecord.device_os = clientDeviceOs;
-        db.updateKey(key, { device_model: clientDeviceModel, device_os: clientDeviceOs });
-      }
-    }
-
-    return sendJson(res, 200, {
-      ok: true,
-      me: {
-        status: 'active',
-        bound_hwid: keyRecord.bound_hwid,
-        device_model: keyRecord.device_model,
-        device_os: keyRecord.device_os,
-        expires_at: keyRecord.expires_at,
-        features: keyRecord.features && Object.keys(keyRecord.features).length > 0 
-          ? keyRecord.features 
-          : db.get().global_features
-      }
-    });
-  }
-
-  // Features GET and PATCH
-  if (pathname === '/api/features') {
-    if (req.method === 'GET') {
-      return sendJson(res, 200, { features: db.get().global_features });
-    }
-    if (req.method === 'PATCH') {
-      const body = await parseJsonBody(req);
-      if (body.features) {
-        db.update(data => {
-          data.global_features = { ...data.global_features, ...body.features };
-        });
-        interceptor.setFeatures(db.get().global_features);
-        if (body.key) {
-          db.updateKey(body.key, { features: body.features });
+        if (p === '/api/admin/keys/generate' && req.method === 'POST') {
+          const body=await jsonBody(req), days=integer(body,'days',1,365,30), count=integer(body,'count',1,20,1), note=text(body,'note',200,false);
+          const generated=[];
+          store.update(d=>{for(let i=0;i<count;i++){
+            const raw='PHTM-'+crypto.randomBytes(16).toString('hex').toUpperCase();
+            const k={id:crypto.randomUUID(),keyHash:hash(raw),label:`PHTM-••••-${raw.slice(-6)}`,days,note,status:'active',createdAt:new Date().toISOString(),activatedAt:null,expiresAt:null,deviceHash:null,deviceLabel:null,generation:1};
+            d.keys.push(k);audit(d,'key.created',k.id);generated.push({key:raw,license:view(k)});
+          }});
+          return send(res,201,{keys:generated});
         }
+        const action=p.match(/^\/api\/admin\/keys\/([a-f0-9-]{36})\/(revoke|extend|unbind)$/);
+        if (action && req.method === 'POST') {
+          const k=store.data.keys.find(x=>x.id===action[1]);if(!k) throw error(404,'Key not found');
+          const oldId=connectionId(k);const body=await jsonBody(req);const days=action[2]==='extend'?integer(body,'days',1,365,30):0;
+          store.update(d=>{const record=d.keys.find(x=>x.id===k.id);
+            if(action[2]==='revoke'){record.status='revoked';record.generation++;}
+            if(action[2]==='unbind'){record.deviceHash=null;record.deviceLabel=null;record.generation++;}
+            if(action[2]==='extend'){
+              if(record.status==='revoked') throw error(409,'Issue a new key for a revoked subscription');
+              if(record.expiresAt) record.expiresAt=new Date(Math.max(Date.now(),Date.parse(record.expiresAt))+days*86400000).toISOString();
+              else { if(record.days+days>365) throw error(400,'Maximum pending duration is 365 days');record.days+=days; }
+            }
+            if(action[2]!=='extend') d.sessions=d.sessions.filter(s=>s.keyId!==k.id);
+            audit(d,'key.'+action[2],k.id);
+          });
+          const disconnected=action[2]==='extend'?null:await monitor.kick([oldId]);
+          return send(res,200,{ok:true,disconnected,license:view(store.data.keys.find(x=>x.id===k.id))});
+        }
+        if(p==='/api/admin/maintenance' && req.method==='POST'){
+          const body=await jsonBody(req);if(typeof body.enabled!=='boolean') throw error(400,'Invalid enabled');
+          store.update(d=>{d.maintenance=body.enabled;audit(d,'maintenance.'+(body.enabled?'on':'off'));});
+          if(body.enabled) await monitor.poll();return send(res,200,{ok:true});
+        }
+        throw error(404,'Not found');
       }
-      return sendJson(res, 200, { ok: true, features: db.get().global_features });
-    }
-  }
-
-  // Tunnel Socket Statistics
-  if (pathname === '/api/engine/tunnel-stats' && req.method === 'GET') {
-    return sendJson(res, 200, gameTunnel.getStats());
-  }
-
-  // Happ Tunnel Config Generation
-  if (pathname === '/api/happ' && req.method === 'POST') {
-    const body = await parseJsonBody(req);
-    const key = body.key || 'PHTM-TEST-1234-5678';
-    const nodes = db.get().nodes;
-
-    const configData = {
-      version: '1.7',
-      client: 'PHANTOM BY NULLDASH',
-      key: key,
-      created_at: new Date().toISOString(),
-      nodes: nodes.map(n => ({
-        name: `${n.flag} ${n.name}`,
-        address: n.host,
-        port: n.port,
-        ping: `${n.ping}ms`,
-        status: n.status
-      })),
-      active_features: db.get().global_features,
-      routing: {
-        rules: [{ domain_suffix: ['freefiremobile.com', 'garena.com'], outbound: 'phantom-tunnel' }]
+      if(p.startsWith('/api/')){
+        const {key:k,session:s}=session(req,'user');limit(req,'user',180);
+        if(p==='/api/me' && req.method==='GET')return send(res,200,{me:view(k),features:FEATURES,maintenance:store.data.maintenance,configured:config.vpn.configured});
+        if(p==='/api/features' && req.method==='GET')return send(res,200,{features:FEATURES});
+        if(p==='/api/features' && req.method==='PATCH')throw error(409,'Game features have no verified implementation');
+        if(p==='/api/happ' && req.method==='POST'){
+          if(!config.vpn.configured)throw error(503,'VPN server is not configured yet');
+          if(store.data.maintenance)throw error(503,'Service is under maintenance');
+          const subscriptionURL=`${config.publicURL}/sub/${token(config,'subscription',k)}`;
+          return send(res,200,{subscriptionURL,deepLink:`happ://add/${subscriptionURL}`});
+        }
+        if(p==='/api/logout' && req.method==='POST'){
+          store.update(d=>{d.sessions=d.sessions.filter(x=>x.hash!==s.hash);});cookie(res,'user','',0);return send(res,200,{ok:true});
+        }
+        throw error(404,'Not found');
       }
-    };
-
-    const encoded = Buffer.from(JSON.stringify(configData)).toString('base64');
-    return sendJson(res, 200, {
-      ok: true,
-      href: 'https://apps.apple.com/us/app/happ-proxy-utility/id6504287215',
-      deepLink: `happ://import?data=${encodeURIComponent(encoded)}`,
-      config: configData
-    });
+      const asset=ASSETS.get(p);
+      if(!asset||req.method!=='GET')throw error(404,'Not found');
+      res.writeHead(200,{'Content-Type':asset[1]});res.end(fs.readFileSync(path.join(ROOT,asset[0])));
+    } catch(e) { if(!res.headersSent)send(res,e.status||500,{error:e.status?e.message:'Server error'});else res.end(); }
   }
-
-  // Reset / Unbind HWID (User side)
-  if ((pathname === '/api/unbind-hwid' || pathname === '/api/reset-hwid') && req.method === 'POST') {
-    const body = await parseJsonBody(req);
-    if (body.key) {
-      db.updateKey(body.key, { bound_hwid: null, device_model: null, device_os: null });
-      return sendJson(res, 200, {
-        ok: true,
-        message: 'Device lock removed. Next login will bind your current device.'
-      });
-    }
-    return sendJson(res, 400, { error: 'key required' });
-  }
-
-  // Config Export Download
-  if (pathname === '/api/config/export') {
-    const nodes = db.get().nodes;
-    const configData = {
-      version: '1.7',
-      client: 'PHANTOM BY NULLDASH',
-      created_at: new Date().toISOString(),
-      nodes: nodes,
-      features: db.get().global_features
-    };
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'Content-Disposition': 'attachment; filename="phantom-happ-config.json"'
-    });
-    res.end(JSON.stringify(configData, null, 2));
-    return;
-  }
-
-  // Logout
-  if (pathname === '/api/logout' && req.method === 'POST') {
-    return sendJson(res, 200, { ok: true });
-  }
-
-  // Real-time Event Stream (SSE)
-  if (pathname === '/api/events') {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive'
-    });
-    res.write('event: connected\ndata: {}\n\n');
-    sseClients.add(res);
-
-    req.on('close', () => {
-      sseClients.delete(res);
-    });
-    return;
-  }
-
-  // ==========================================
-  // BACKEND ADMIN API ENDPOINTS (/api/admin/...)
-  // ==========================================
-
-  // Admin Overview Metrics
-  if (pathname === '/api/admin/overview' && req.method === 'GET') {
-    const data = db.get();
-    const totalKeys = data.keys.length;
-    const activeKeys = data.keys.filter(k => k.status === 'active' && new Date(k.expires_at) > Date.now()).length;
-    const unboundKeys = data.keys.filter(k => !k.bound_hwid).length;
-    const expiredKeys = data.keys.filter(k => new Date(k.expires_at) <= Date.now()).length;
-    const revokedKeys = data.keys.filter(k => k.status === 'revoked').length;
-    const totalUsers = data.nodes.reduce((acc, n) => acc + (n.users || 0), 0);
-
-    return sendJson(res, 200, {
-      totalKeys,
-      activeKeys,
-      unboundKeys,
-      expiredKeys,
-      revokedKeys,
-      totalUsers,
-      maintenance: data.maintenance,
-      nodes: data.nodes
-    });
-  }
-
-  // Admin Keys List
-  if (pathname === '/api/admin/keys' && req.method === 'GET') {
-    const data = db.get();
-    return sendJson(res, 200, { keys: data.keys });
-  }
-
-  // Admin Generate Keys
-  if (pathname === '/api/admin/keys/generate' && req.method === 'POST') {
-    const body = await parseJsonBody(req);
-    const count = Math.min(Math.max(parseInt(body.count, 10) || 1, 1), 50);
-    const durationDays = parseInt(body.days, 10) || 30;
-    const note = body.note || 'Generated from Admin Panel';
-    const prefix = (body.prefix || 'PHTM').trim().toUpperCase();
-
-    const createdKeys = [];
-    for (let i = 0; i < count; i++) {
-      const newKeyStr = generateRandomKey(prefix);
-      const newKeyObj = {
-        key: newKeyStr,
-        status: 'active',
-        bound_hwid: null,
-        device_model: null,
-        created_at: new Date().toISOString(),
-        expires_at: durationDays > 999 
-          ? new Date(Date.now() + 10 * 365 * 24 * 3600 * 1000).toISOString() // lifetime
-          : new Date(Date.now() + durationDays * 24 * 3600 * 1000).toISOString(),
-        note: note,
-        features: db.get().global_features
-      };
-      db.addKey(newKeyObj);
-      createdKeys.push(newKeyObj);
-    }
-
-    return sendJson(res, 200, { ok: true, keys: createdKeys });
-  }
-
-  // Admin Key Actions (Unbind HWID, Toggle Status, Extend, Delete)
-  const keyActionMatch = pathname.match(/^\/api\/admin\/keys\/([^/]+)\/(unbind|toggle-status|extend)$/);
-  if (keyActionMatch && req.method === 'POST') {
-    const targetKey = decodeURIComponent(keyActionMatch[1]);
-    const action = keyActionMatch[2];
-
-    const keyObj = db.findKey(targetKey);
-    if (!keyObj) {
-      return sendJson(res, 404, { error: 'Key not found' });
-    }
-
-    if (action === 'unbind') {
-      db.updateKey(targetKey, { bound_hwid: null, device_model: null });
-      return sendJson(res, 200, { ok: true, message: `Unbound HWID for ${targetKey}` });
-    }
-
-    if (action === 'toggle-status') {
-      const newStatus = keyObj.status === 'active' ? 'revoked' : 'active';
-      db.updateKey(targetKey, { status: newStatus });
-      if (newStatus === 'revoked') {
-        broadcastEvent('logout', { key: targetKey });
-      }
-      return sendJson(res, 200, { ok: true, status: newStatus });
-    }
-
-    if (action === 'extend') {
-      const body = await parseJsonBody(req);
-      const addDays = parseInt(body.days, 10) || 30;
-      const currentExpiry = new Date(keyObj.expires_at).getTime();
-      const base = currentExpiry > Date.now() ? currentExpiry : Date.now();
-      const newExpiry = new Date(base + addDays * 24 * 3600 * 1000).toISOString();
-      db.updateKey(targetKey, { expires_at: newExpiry, status: 'active' });
-      return sendJson(res, 200, { ok: true, expires_at: newExpiry });
-    }
-  }
-
-  // Admin Delete Key
-  const deleteKeyMatch = pathname.match(/^\/api\/admin\/keys\/([^/]+)$/);
-  if (deleteKeyMatch && req.method === 'DELETE') {
-    const targetKey = decodeURIComponent(deleteKeyMatch[1]);
-    db.deleteKey(targetKey);
-    broadcastEvent('logout', { key: targetKey });
-    return sendJson(res, 200, { ok: true });
-  }
-
-  // Admin Update Maintenance Settings
-  if (pathname === '/api/admin/maintenance' && req.method === 'POST') {
-    const body = await parseJsonBody(req);
-    const updated = db.setMaintenance({
-      enabled: typeof body.enabled === 'boolean' ? body.enabled : false,
-      blocked: typeof body.blocked === 'boolean' ? body.blocked : false,
-      allowed_logins: Array.isArray(body.allowed_logins) 
-        ? body.allowed_logins 
-        : (body.allowed_logins || '').split(',').map(s => s.trim()).filter(Boolean),
-      title: body.title || 'maintenance',
-      message: body.message || "we're doing maintenance. everything is paused until we're back."
-    });
-
-    broadcastEvent('maintenance', updated.maintenance);
-    return sendJson(res, 200, { ok: true, maintenance: updated.maintenance });
-  }
-
-  // ==========================================
-  // STATIC ASSET & PAGE ROUTING
-  // ==========================================
-  let filePath;
-
-  // Admin Panel Routes
-  if (pathname === '/admin' || pathname === '/admin/' || pathname === '/admin/index.html') {
-    filePath = path.join(ROOT_DIR, 'public', 'admin.html');
-  } else if (pathname === '/admin/admin.js' || pathname === '/admin.js') {
-    filePath = path.join(ROOT_DIR, 'public', 'admin.js');
-  } else if (pathname === '/' || pathname === '/index.html') {
-    filePath = path.join(ROOT_DIR, 'index.html');
-  } else if (pathname.startsWith('/src/')) {
-    filePath = path.join(ROOT_DIR, pathname);
-  } else if (pathname.startsWith('/media/')) {
-    filePath = path.join(ROOT_DIR, 'public', pathname);
-  } else if (pathname === '/icon' || pathname === '/icon.png') {
-    filePath = path.join(ROOT_DIR, 'public', 'icon.png');
-  } else if (pathname === '/apple-icon' || pathname === '/apple-icon.png') {
-    filePath = path.join(ROOT_DIR, 'public', 'apple-icon.png');
-  } else if (pathname === '/opengraph-image' || pathname === '/opengraph-image.png') {
-    filePath = path.join(ROOT_DIR, 'public', 'opengraph-image.png');
-  } else {
-    // Check in public/ then in root
-    const cleanPath = pathname.startsWith('/') ? pathname.slice(1) : pathname;
-    const pubPath = path.join(ROOT_DIR, 'public', cleanPath);
-    const rootPath = path.join(ROOT_DIR, cleanPath);
-    if (fs.existsSync(pubPath)) {
-      filePath = pubPath;
-    } else if (fs.existsSync(rootPath)) {
-      filePath = rootPath;
-    } else {
-      filePath = path.join(ROOT_DIR, 'index.html');
-    }
-  }
-
-  const ext = path.extname(filePath).toLowerCase();
-  const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-
-  fs.readFile(filePath, (err, content) => {
-    if (err) {
-      if (err.code === 'ENOENT') {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('404 Not Found');
-      } else {
-        res.writeHead(500, { 'Content-Type': 'text/plain' });
-        res.end('500 Internal Server Error');
-      }
-    } else {
-      res.writeHead(200, { 'Content-Type': contentType });
-      res.end(content);
-    }
+  const server=http.createServer({requestTimeout:15000,headersTimeout:10000,maxHeaderSize:16384},handler);
+  // A separate loopback-only service. Never route this port through the public proxy.
+  const authServer=http.createServer({requestTimeout:10000,headersTimeout:10000,maxHeaderSize:8192},async(req,res)=>{
+    res.setHeader('Cache-Control','no-store');
+    try{
+      if(req.method!=='POST'||req.url!=='/auth')throw error(404,'Not found');
+      limit(req,'vpn-auth',300);
+      const body=await jsonBody(req);
+      const k=resolveToken(config,store,'vpn',body.auth);
+      if(!config.vpn.configured||store.data.maintenance||!k)return send(res,200,{ok:false});
+      if(!k.activatedAt)store.update(d=>{const record=d.keys.find(x=>x.id===k.id);if(!record.activatedAt){record.activatedAt=new Date().toISOString();record.expiresAt=new Date(Date.now()+record.days*86400000).toISOString();audit(d,'vpn.first-auth',record.id);}});
+      return send(res,200,{ok:true,id:connectionId(k)});
+    }catch(e){send(res,e.status||500,{ok:false});}
   });
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n==============================================`);
-  console.log(`🚀 PHANTOM NullDash Core System running on:`);
-  console.log(`👉 Client Portal: http://localhost:${PORT}/`);
-  console.log(`👉 Admin Panel:   http://localhost:${PORT}/admin`);
-  console.log(`==============================================\n`);
-});
+  let timer;
+  return { server,authServer,store,monitor,
+    startMonitor(){monitor.poll();timer=setInterval(()=>monitor.poll(),15000);timer.unref();},
+    async close(){clearInterval(timer);await Promise.all([server,authServer].map(s=>new Promise(r=>{s.closeAllConnections();s.close(r);})));},
+  };
+}
+if(require.main===module){
+  if(fs.existsSync(path.join(ROOT,'.env')))process.loadEnvFile(path.join(ROOT,'.env'));
+  try{
+    const config=configFromEnv();const app=createApplication(config);
+    for(const server of [app.server,app.authServer])server.on('error',()=>{console.error('Cannot bind service. Check configured ports.');process.exit(1);});
+    app.server.listen(config.port,config.host,()=>console.log(`PHANTOM portal: ${config.publicURL}`));
+    app.authServer.listen(config.authPort,'127.0.0.1');app.startMonitor();
+    for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>app.close().then(()=>process.exit(0)));
+  }catch(e){console.error(e.message);process.exit(1);}
+}
+module.exports={createApplication};
